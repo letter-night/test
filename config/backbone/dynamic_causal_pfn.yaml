@@ -6,7 +6,7 @@ model:
 
     # Keep the same convention as GT: model sees padded history + (optional) projection horizon
     # If your PFN uses only history length, you can set this to ${dataset.max_seq_length} instead.
-    max_seq_length: ${sum:${dataset.max_seq_length},${dataset.projection_horizon}}
+    max_seq_length: ${dataset.max_seq_length}
 
     # PFN backbone hyperparams
     seq_hidden_units:                    # embedding dim (embed_dim)
