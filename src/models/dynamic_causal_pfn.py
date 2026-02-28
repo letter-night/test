@@ -384,6 +384,36 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         data_loader = DataLoader(dataset, batch_size=self.hparams.dataset.val_batch_size, shuffle=False)
         outcome_pred, _ = [torch.cat(arrs) for arrs in zip(*self.trainer.predict(self, data_loader))]
         return outcome_pred.numpy()
+    
+
+    def get_normalised_n_step_rmses(self, dataset: Dataset):
+        logger.info(f'RMSE calculation for {dataset.subset_name}.')
+
+        outputs_scaled = self.get_predictions(dataset)
+        unscale = self.hparams.exp.unscale_rmse
+        percentage = self.hparams.exp.percentage_rmse
+
+        # Only evaluate RMSE on final outcome (same as GT)
+        if unscale:
+            output_stds, output_means = dataset.scaling_params['output_stds'], dataset.scaling_params['output_means']
+            outputs_unscaled = outputs_scaled * output_stds + output_means
+            mse = ((outputs_unscaled - dataset.data_processed_seq['unscaled_outputs'][:, (self.projection_horizon - 1)]) ** 2)
+        else:
+            mse = ((outputs_scaled - dataset.data_processed_seq['outputs'][:, (self.projection_horizon - 1)]) ** 2)
+
+        nan_idx = np.unique(np.where(np.isnan(dataset.data_processed_seq['outputs']))[0])
+        not_nan = np.array([i for i in range(outputs_scaled.shape[0]) if i not in nan_idx])
+        mse = mse[not_nan]
+
+        mse = mse.mean()  # mean across batch
+        rmse_normalised = np.sqrt(mse) / dataset.norm_const
+
+        if percentage:
+            rmse_normalised *= 100.0
+
+        return rmse_normalised
+
+
 
     def configure_optimizers(self):
         optimizer = self._get_optimizer(list(self.named_parameters()))
@@ -405,4 +435,3 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         sub_args.fc_hidden_units = int(sub_args.hr_size * new_args["fc_hidden_units"])
         sub_args.dropout_rate = new_args["dropout_rate"]
         sub_args.num_layer = new_args["num_layer"] if "num_layer" in new_args else sub_args.num_layer
-
