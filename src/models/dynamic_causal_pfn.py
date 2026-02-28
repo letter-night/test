@@ -186,7 +186,12 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         """
         x = self._build_series_input(prev_treatments, vitals, prev_outputs, static_features)  # [B,T,C]
         B, T, C = x.shape
-        assert T == self.max_seq_length, f"Expected T={self.max_seq_length}, got {T}"
+        L = self.max_seq_length
+        if T < L:
+            pad = torch.zeros(B, L - T, C, device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+        elif T > L:
+            x = x[:, :L, :]
 
         # embedding + transformer
         enc = self.enc_embedding(x)               # [B, C*n_patches, D]
