@@ -1,0 +1,25 @@
+# @package _global_
+dataset:
+  coeff: 10.0
+
+model:
+  dynamic_causal_pfn:
+    optimizer:
+      learning_rate: 0.01
+    batch_size: 128
+
+    # Reasonable starting point mirroring GT capacity
+    e_layers: 2
+    seq_hidden_units: 16
+    hr_size: 8
+    fc_hidden_units: 4
+    dropout_rate: 0.1
+
+    # PFN-specific knobs (choose sane defaults if you don't tune them)
+    patch_size: 10
+    n_heads: 1
+    d_ff: 64
+    activation: gelu
+
+exp:
+  max_epochs: 50
