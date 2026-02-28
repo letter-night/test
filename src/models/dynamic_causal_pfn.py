@@ -29,6 +29,10 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
     - GT-style single model (model_type is a single key)
     - GT-style G-computation training logic (pseudo outcomes) when projection_horizon > 0
     - Standard masked MSE loss (like other baselines)
+
+    IMPORTANT:
+      For cancer_sim, processed sequences have length (dataset.max_seq_length - 1) due to offset=1 in process_data().
+      We therefore infer seq_len directly from the processed dataset tensors to avoid time-dimension mismatches.
     """
 
     model_type = "dynamic_causal_pfn"
@@ -61,12 +65,24 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
 
         # Used by GT g-computation under fixed treatment sequence intervention
         self.treatment_sequence = torch.tensor(args.dataset.treatment_sequence)[: self.projection_horizon + 1, :]
-        self.max_projection = args.dataset.projection_horizon if self.dataset_collection is not None else self.projection_horizon
+        self.max_projection = (
+            args.dataset.projection_horizon if self.dataset_collection is not None else self.projection_horizon
+        )
         assert self.projection_horizon <= self.max_projection
+
+        # --- infer TRUE processed sequence length ---
+        # train script typically calls dataset_collection.process_data_multi() BEFORE instantiating the model
+        if self.dataset_collection is not None and hasattr(self.dataset_collection, "train_f") and self.dataset_collection.train_f is not None:
+            # current_treatments time dim is the canonical time length in this repo
+            self.seq_len = int(self.dataset_collection.train_f.data["current_treatments"].shape[1])
+        else:
+            # fallback (cancer_sim offset=1)
+            self.seq_len = int(args.dataset.max_seq_length) - 1
 
         # --- repo tuning convention (same as GT) ---
         self.input_size = max(self.dim_treatments, self.dim_static_features, self.dim_vitals, self.dim_outcome)
         logger.info(f"Max input size of {self.model_type}: {self.input_size}")
+        logger.info(f"[{self.model_type}] Using seq_len={self.seq_len} (processed time length).")
 
         self._init_specific(args)
         self.save_hyperparameters(args)
@@ -79,12 +95,14 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
     def _init_specific(self, args: DictConfig) -> None:
         """
         PFN backbone + g-computation heads init.
-        Must output per-time hidden representation hr: [B,T,hr_size].
+        Must output per-time hidden representation hr: [B,T,hr_size] with T matching batch time dim.
         """
         try:
             sub_args = args.model[self.model_type]
 
+            # Keep for logging/config, but PFN itself uses self.seq_len
             self.max_seq_length = sub_args.max_seq_length
+
             self.hr_size = sub_args.hr_size
             self.seq_hidden_units = sub_args.seq_hidden_units  # embed_dim
             self.fc_hidden_units = sub_args.fc_hidden_units
@@ -97,22 +115,28 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             self.activation = sub_args.activation
 
             if (
-                self.max_seq_length is None
-                or self.hr_size is None
+                self.hr_size is None
                 or self.seq_hidden_units is None
                 or self.fc_hidden_units is None
                 or self.dropout_rate is None
+                or self.patch_size is None
+                or self.n_heads is None
+                or self.d_ff is None
+                or self.e_layers is None
             ):
                 raise MissingMandatoryValue()
 
             # Input channels to PFN embedding: prev_treatments + prev_outputs + vitals(optional) + static(broadcast)
+            # NOTE: For cancer_sim multi-input, prev_outputs has dim_outcome and static_features has dim_static_features.
             self.in_channels = self.dim_treatments + self.dim_outcome + self.dim_static_features
             if self.has_vitals:
                 self.in_channels += self.dim_vitals
 
-            # 1) PFN embedding (expects x: [B,T,C])
+            L = self.seq_len  # <-- critical
+
+            # 1) PFN embedding (expects x: [B,L,C])
             self.enc_embedding = DataEmbedding_FeaturePatching(
-                seq_len=self.max_seq_length,
+                seq_len=L,
                 patch_size=self.patch_size,
                 embed_dim=self.seq_hidden_units,
                 dropout=self.dropout_rate,
@@ -138,12 +162,13 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             )
 
             # 3) Patch tokens -> per-time representation
-            # DataEmbedding_FeaturePatching returns [B, in_channels * n_patches, embed_dim]
-            # We reshape back to [B, in_channels, n_patches * embed_dim], then map to [B, T, hr_size]
-            n_patches = (self.max_seq_length - self.patch_size) // (self.patch_size // 2) + 1
+            n_patches = (L - self.patch_size) // (self.patch_size // 2) + 1
             self._n_patches = n_patches
 
-            self.proj_tokens_to_time = nn.Linear(n_patches * self.seq_hidden_units, self.max_seq_length)
+            # After embedding we reshape to [B, in_channels, n_patches*D] then project to time length L
+            self.proj_tokens_to_time = nn.Linear(n_patches * self.seq_hidden_units, L)
+
+            # Map per-time channel features -> hr_size
             self.hr_output_transformation = nn.Linear(self.in_channels, self.hr_size)
             self.hr_dropout = nn.Dropout(self.dropout_rate)
 
@@ -151,7 +176,7 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             self.G_comp_heads = nn.ModuleList(
                 [
                     OutcomeHead(
-                        self.seq_hidden_units,  # not used directly inside OutcomeHead in some repos; keep consistent
+                        self.seq_hidden_units,  # kept consistent with other models
                         self.hr_size,
                         self.fc_hidden_units,
                         self.dim_treatments,
@@ -174,39 +199,51 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         parts = [prev_treatments, prev_outputs]
         if self.has_vitals:
             parts.append(vitals)
-        # broadcast static across time
-        s = static_features.unsqueeze(1).expand(-1, prev_treatments.size(1), -1)
+        s = static_features.unsqueeze(1).expand(-1, prev_treatments.size(1), -1)  # [B,T,S]
         parts.append(s)
-        return torch.cat(parts, dim=-1)  # [B,T,C] where C = in_channels
+        x = torch.cat(parts, dim=-1)  # [B,T,in_channels]
+        return x
 
     def build_hr(self, prev_treatments, vitals, prev_outputs, static_features, active_entries) -> torch.Tensor:
         """
         Produce per-time hidden representation hr: [B,T,hr_size].
-        active_entries currently not used inside PFN, but kept for API symmetry.
+        Ensures time dimension matches the batch time dimension for compatibility with OutcomeHead.
         """
         x = self._build_series_input(prev_treatments, vitals, prev_outputs, static_features)  # [B,T,C]
-        B, T, C = x.shape
-        L = self.max_seq_length
-        if T < L:
-            pad = torch.zeros(B, L - T, C, device=x.device, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=1)
-        elif T > L:
-            x = x[:, :L, :]
+        B, T_batch, C = x.shape
+
+        # PFN modules were built for self.seq_len. Pad/trim x to that length.
+        L = self.seq_len
+        if T_batch < L:
+            pad = torch.zeros(B, L - T_batch, C, device=x.device, dtype=x.dtype)
+            x_in = torch.cat([x, pad], dim=1)
+        elif T_batch > L:
+            x_in = x[:, :L, :]
+        else:
+            x_in = x
 
         # embedding + transformer
-        enc = self.enc_embedding(x)               # [B, C*n_patches, D]
-        enc, _ = self.transformer_encoder(enc)    # same shape
+        enc = self.enc_embedding(x_in)               # [B, in_channels*n_patches, D]
+        enc, _ = self.transformer_encoder(enc)       # same
 
-        # reshape: [B, C, n_patches*D]
-        enc = enc.reshape(B, C, self._n_patches * self.seq_hidden_units)
+        # reshape: [B, in_channels, n_patches*D]
+        # IMPORTANT: use self.in_channels, not C (they should match, but this is safer)
+        enc = enc.reshape(B, self.in_channels, self._n_patches * self.seq_hidden_units)
 
-        # map patch axis -> time, producing [B, C, T], then transpose to [B, T, C]
-        time_feats = self.proj_tokens_to_time(enc)       # [B, C, T]
-        time_feats = time_feats.transpose(1, 2)          # [B, T, C]
+        # [B, in_channels, L] -> [B, L, in_channels]
+        time_feats = self.proj_tokens_to_time(enc).transpose(1, 2)
 
-        # project channels -> hr_size (per time)
-        hr = F.elu(self.hr_output_transformation(time_feats))  # [B,T,hr_size]
+        # [B, L, hr_size]
+        hr = F.elu(self.hr_output_transformation(time_feats))
         hr = self.hr_dropout(hr)
+
+        # Final alignment: return hr with EXACT batch time length T_batch
+        if hr.size(1) > T_batch:
+            hr = hr[:, :T_batch, :]
+        elif hr.size(1) < T_batch:
+            pad = torch.zeros(B, T_batch - hr.size(1), hr.size(2), device=hr.device, dtype=hr.dtype)
+            hr = torch.cat([hr, pad], dim=1)
+
         return hr
 
     def forward(self, batch):
@@ -232,6 +269,10 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             # ---- factual one-step training ----
             if self.projection_horizon == 0:
                 hr = self.build_hr(prev_treatments, vitals, prev_outputs, static_features, active_entries)
+                # Guard: ensure time dims match
+                if hr.size(1) != curr_treatments.size(1):
+                    T = curr_treatments.size(1)
+                    hr = hr[:, :T, :]
                 pred_factuals = self.G_comp_heads[0].build_outcome(hr, curr_treatments)  # [B,T,Y]
                 return pred_factuals, None, None, active_entries
 
@@ -246,14 +287,12 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             )
 
             for t in range(1, time_dim - self.projection_horizon):
-                # mask future part for this t (like GT)
                 current_active_entries = batch["active_entries"].clone()
                 current_active_entries[:, int(t + self.projection_horizon) :] = 0.0
                 active_entries_all_steps[:, t - 1, :] = current_active_entries[:, t + self.projection_horizon - 1, :]
 
-                # 1) generate pseudo outcomes under counterfactual treatment sequence (no grad)
+                # 1) pseudo outcomes under counterfactual treatment sequence (no grad)
                 with torch.no_grad():
-                    # Replace current treatments on [t-1, ..., t+H-1] with intervention sequence
                     indexes_cf = (torch.arange(0, time_dim, device=self.device) >= (t - 1)) & (
                         torch.arange(0, time_dim, device=self.device) < (t + self.projection_horizon)
                     )
@@ -261,18 +300,16 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
                     curr_treatments_cf = curr_treatments.clone()
                     curr_treatments_cf[:, indexes_cf, :] = self.treatment_sequence.to(self.device)
 
-                    # prev_treatments is shifted current treatments
-                    prev_treatments_cf = torch.cat(
-                        (prev_treatments[:, :1, :], curr_treatments_cf[:, :-1, :]), dim=1
-                    )
+                    prev_treatments_cf = torch.cat((prev_treatments[:, :1, :], curr_treatments_cf[:, :-1, :]), dim=1)
 
-                    hr_cf = self.build_hr(prev_treatments_cf, vitals, prev_outputs, static_features, current_active_entries)
+                    hr_cf = self.build_hr(
+                        prev_treatments_cf, vitals, prev_outputs, static_features, current_active_entries
+                    )
 
                     pseudo_outcomes = torch.zeros(
                         (batch_size, self.projection_horizon + 1, self.dim_outcome), device=self.device
                     )
 
-                    # nested expectations: heads H..1 generate pseudo outcomes, last is factual observed outcome
                     for i in range(self.projection_horizon, 0, -1):
                         pseudo_outcome = self.G_comp_heads[i].build_outcome(hr_cf, curr_treatments_cf)[:, t + i - 1, :]
                         pseudo_outcomes[:, i - 1, :] = pseudo_outcome
@@ -295,7 +332,6 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             return None, pred_pseudos_all_steps, pseudo_outcomes_all_steps, active_entries_all_steps
 
         # ---- evaluation / prediction ----
-        # replicate GT masking rule for prediction horizon
         fixed_split = batch["sequence_lengths"] - self.max_projection if self.projection_horizon > 0 else batch["sequence_lengths"]
         for i in range(len(active_entries)):
             active_entries[i, int(fixed_split[i] + self.projection_horizon) :] = 0.0
@@ -303,9 +339,9 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         hr = self.build_hr(prev_treatments, vitals, prev_outputs, static_features, active_entries)
 
         if self.projection_horizon > 0:
-            pred_outcomes = self.G_comp_heads[0].build_outcome(hr, curr_treatments)  # [B,T,Y]
+            pred_outcomes = self.G_comp_heads[0].build_outcome(hr, curr_treatments)
             index_pred = (torch.arange(0, time_dim, device=self.device) == fixed_split[..., None] - 1)
-            pred_outcomes = pred_outcomes[index_pred]  # [B,Y] in GT; keep same
+            pred_outcomes = pred_outcomes[index_pred]  # [B,Y] (GT-style)
         else:
             pred_outcomes = self.G_comp_heads[0].build_outcome(hr, curr_treatments)  # [B,T,Y]
 
@@ -315,7 +351,6 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         pred_factuals, pred_pseudos, pseudo_outcomes, active_entries_all_steps = self(batch)
 
         if self.projection_horizon > 0:
-            # active_entries_all_steps: [B, steps, 1] -> broadcast to outcome dims
             active_entries_all_steps = active_entries_all_steps.unsqueeze(-2)  # [B,steps,1,1]
             mse = F.mse_loss(pred_pseudos, pseudo_outcomes, reduction="none")  # [B,steps,H+1,Y]
             mse = (mse * active_entries_all_steps).sum(dim=(0, 1)) / (
@@ -323,7 +358,14 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
             )
 
             for i in range(mse.shape[0]):
-                self.log(f"{self.model_type}_mse_{i}", mse[i].mean(), on_epoch=True, on_step=False, sync_dist=True, prog_bar=True)
+                self.log(
+                    f"{self.model_type}_mse_{i}",
+                    mse[i].mean(),
+                    on_epoch=True,
+                    on_step=False,
+                    sync_dist=True,
+                    prog_bar=True,
+                )
 
             loss = mse.mean()
         else:
@@ -351,7 +393,6 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
 
     @staticmethod
     def set_hparams(model_args: DictConfig, new_args: dict, input_size: int, model_type: str):
-        # ray tuning compatibility (like GT)
         sub_args = model_args[model_type]
         sub_args.optimizer.learning_rate = new_args["learning_rate"]
         sub_args.batch_size = new_args["batch_size"]
@@ -364,3 +405,4 @@ class DynamicCausalPFN(TimeVaryingCausalModel):
         sub_args.fc_hidden_units = int(sub_args.hr_size * new_args["fc_hidden_units"])
         sub_args.dropout_rate = new_args["dropout_rate"]
         sub_args.num_layer = new_args["num_layer"] if "num_layer" in new_args else sub_args.num_layer
+
